@@ -1,200 +1,234 @@
-const suits = ['♠', '♥', '♦', '♣'];
-const ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
+const { Hand } = require('pokersolver');
+
+let games = {}; // 保存每个房间的游戏状态
 
 function createDeck() {
+  const suits = ['s', 'h', 'd', 'c']; // 黑红方梅
+  const values = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
   const deck = [];
-  for (let suit of suits) {
-    for (let rank of ranks) {
-      deck.push(rank + suit);
+  for (const suit of suits) {
+    for (const value of values) {
+      deck.push(value + suit);
     }
-  }
-  // 洗牌
-  for (let i = deck.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [deck[i], deck[j]] = [deck[j], deck[i]];
   }
   return deck;
 }
 
-function createRoomIfNotExists(rooms, roomId) {
-  if (!rooms[roomId]) {
-    rooms[roomId] = {
-      players: [],
-      communityCards: [],
-      deck: [],
-      pot: 0,
-      currentPlayerIndex: 0,
-      phase: 'waiting',
-    };
+function shuffleDeck(deck) {
+  for (let i = deck.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [deck[i], deck[j]] = [deck[j], deck[i]];
   }
-}
-
-function getRoomState(room, currentPlayerId) {
-  return {
-    players: room.players.map((p, i) => ({
-      id: p.id,
-      name: p.name,
-      chips: p.chips,
-      hand: p.id === currentPlayerId ? p.hand : [],  // 只给自己显示手牌
-      folded: p.folded,
-      isTurn: p.id === room.players[room.currentPlayerIndex]?.id
-
-    })),
-    communityCards: room.communityCards,
-    pot: room.pot,
-    phase: room.phase,
-  };
 }
 
 function startGame(room) {
-  room.deck = createDeck();
-  room.communityCards = [];
-  room.pot = 0;
-  room.phase = 'preflop';
-  room.currentPlayerIndex = 0;
-  room.actionsInRound = new Set(); // 记录本轮已行动玩家
-
-  room.players.forEach(p => {
-    p.hand = [room.deck.pop(), room.deck.pop()];
-    p.folded = false;
-  });
-
-  // 确保 currentPlayerIndex 指向第一个未弃牌玩家
-  room.currentPlayerIndex = room.players.findIndex(p => !p.folded);
-}
-
-function nextPhase(room) {
-  switch (room.phase) {
-    case 'preflop':
-      room.phase = 'flop';
-      room.communityCards = [room.deck.pop(), room.deck.pop(), room.deck.pop()];
-      break;
-    case 'flop':
-      room.phase = 'turn';
-      room.communityCards.push(room.deck.pop());
-      break;
-    case 'turn':
-      room.phase = 'river';
-      room.communityCards.push(room.deck.pop());
-      break;
-    case 'river':
-      room.phase = 'showdown';
-      settleGame(room); // 结算
-      break;
-    default:
-      break;
+  if (!games[room] || !games[room].players || games[room].players.length === 0) {
+    console.log(`房间 ${room} 不存在或没有玩家，无法开始游戏`);
+    return;
   }
-  // 重置行动到第一位活跃玩家
-  room.currentPlayerIndex = room.players.findIndex(p => !p.folded);
+  const game = {
+    players: [],
+    deck: [],
+    communityCards: [],
+    pot: 0,
+    currentPlayerIndex: 0,
+    round: 'preflop', // 可为 'preflop', 'flop', 'turn', 'river', 'showdown'
+    gameStarted: true,
+  };
+
+  game.deck = createDeck();
+  shuffleDeck(game.deck);
+
+  for (const player of games[room].players) {
+    player.hand = [game.deck.pop(), game.deck.pop()];
+    player.folded = false;
+    player.allIn = false;
+    player.currentBet = 0;
+    player.totalBet = 0;
+    player.bet = 0;
+    player.winner = false;
+  }
+  broadcastGameState(room);
+  console.log(`房间 ${room} 游戏开始，玩家手牌已发`);
+}
+function broadcastGameState(room) {
+  const game = games[room];
+  if (!game) return;
+  io.to(room).emit('roomUpdate', game);
 }
 
-function handlePlayerAction(room, playerId, action) {
-  if (room.phase === 'end' || room.phase === 'showdown') return;
-  const player = room.players.find(p => p.id === playerId);
-  if (!player || player.folded) return;
+function getActivePlayers(game) {
+  return game.players.filter(p => !p.folded && !p.allIn);
+}
+
+function advanceRound(game) {
+  if (game.round === 'preflop') {
+    game.communityCards = game.deck.splice(0, 3); // Flop
+    game.round = 'flop';
+  } else if (game.round === 'flop') {
+    game.communityCards.push(game.deck.pop()); // Turn
+    game.round = 'turn';
+  } else if (game.round === 'turn') {
+    game.communityCards.push(game.deck.pop()); // River
+    game.round = 'river';
+  } else if (game.round === 'river') {
+    game.round = 'showdown';
+    settleGame(game);
+    return;
+  }
+
+  // 重置下注
+  for (const p of game.players) {
+    p.currentBet = 0;
+  }
+
+  game.currentPlayerIndex = game.players.findIndex(p => !p.folded && !p.allIn);
+}
+
+function handlePlayerAction(game, playerName, action, amount = 0) {
+  const player = game.players.find(p => p.name === playerName);
+  if (!player || player.folded || player.allIn || game.round === 'showdown') return;
 
   switch (action) {
     case 'fold':
       player.folded = true;
       break;
     case 'call':
-      room.pot += 10;
-      player.chips -= 10;
+      const maxBet = Math.max(...game.players.map(p => p.currentBet));
+      const toCall = maxBet - player.currentBet;
+      player.currentBet += toCall;
+      player.totalBet += toCall;
+      player.bet += toCall;
+      game.pot += toCall;
       break;
     case 'raise':
-      room.pot += 20;
-      player.chips -= 20;
+      const raiseAmount = amount;
+      const currentMax = Math.max(...game.players.map(p => p.currentBet));
+      const total = currentMax - player.currentBet + raiseAmount;
+      player.currentBet += total;
+      player.totalBet += total;
+      player.bet += total;
+      game.pot += total;
+      break;
+    case 'allin':
+      player.allIn = true;
+      const allInAmount = amount;
+      player.currentBet += allInAmount;
+      player.totalBet += allInAmount;
+      player.bet += allInAmount;
+      game.pot += allInAmount;
       break;
   }
 
-  room.actionsInRound.add(playerId);  // 记录玩家已行动
+  // 跳过下一个已弃牌/All-in玩家
+  let nextIndex = (game.currentPlayerIndex + 1) % game.players.length;
+  while (game.players[nextIndex].folded || game.players[nextIndex].allIn) {
+    nextIndex = (nextIndex + 1) % game.players.length;
+    if (nextIndex === game.currentPlayerIndex) break;
+  }
 
-  const activePlayers = room.players.filter(p => !p.folded);
+  game.currentPlayerIndex = nextIndex;
+
+  const activePlayers = getActivePlayers(game);
+  const betsEqual = activePlayers.every(p => p.currentBet === activePlayers[0].currentBet);
 
   if (activePlayers.length <= 1) {
-    settleGame(room); // 结算   
-    room.phase = 'end';
+    game.round = 'showdown';
+    settleGame(game);
     return;
   }
 
-  // 判断本轮所有未弃牌玩家是否都已行动
-  const allActed = activePlayers.every(p => room.actionsInRound.has(p.id));
-
-  if (allActed) {
-    room.actionsInRound.clear();
-    nextPhase(room);
-  } else {
-    // 继续下一位玩家行动
-    do {
-      room.currentPlayerIndex = (room.currentPlayerIndex + 1) % room.players.length;
-    } while (room.players[room.currentPlayerIndex].folded);
+  if (betsEqual && action !== 'raise') {
+    advanceRound(game);
   }
 }
 
 function settleGame(room) {
-    const activePlayers = room.players.filter(p => !p.folded);
+    const livePlayers = room.players.filter(p => !p.folded);
+    const community = room.communityCards;
   
-    // 没有活跃玩家？异常情况
-    if (activePlayers.length === 0) {
-      console.warn('无玩家参与结算');
-      room.phase = 'end';
-      return;
+    const playerHands = livePlayers.map(p => {
+      const fullHand = Hand.solve([...p.hand, ...community]);
+      return {
+        player: p,
+        solverHand: fullHand
+      };
+    });
+  
+    const winners = Hand.winners(playerHands.map(p => p.solverHand));
+  
+    for (const { player, solverHand } of playerHands) {
+      player.handDesc = solverHand.descr;
+      player.handSolved = solverHand.cards.map(c => c.value + c.suit);
     }
   
-    // 仅剩一人，直接获胜
-    if (activePlayers.length === 1) {
-      const winner = activePlayers[0];
-      winner.chips += room.pot;
-      console.log(`仅剩一人 ${winner.name} 获胜，获得 ${room.pot} 筹码`);
-      room.pot = 0;
-      room.phase = 'end';
-      return;
+    winners.forEach(w => {
+      const winnerPlayer = playerHands.find(p => p.solverHand === w)?.player;
+      if (winnerPlayer) winnerPlayer.winner = true;
+    });
+  
+    const winAmount = Math.floor(room.pot / winners.length);
+    for (const w of winners) {
+      const winnerPlayer = playerHands.find(p => p.solverHand === w)?.player;
+      if (winnerPlayer) winnerPlayer.chips += winAmount;
     }
   
-    // 简化：比最大牌点数
-    function cardRank(card) {
-      const rankOrder = '23456789TJQKA';
-      return rankOrder.indexOf(card[0]);
-    }
-  
-    let winner = null;
-    let bestRank = -1;
-  
-    for (const player of activePlayers) {
-      const allCards = [...player.hand, ...room.communityCards];
-      const playerBestRank = Math.max(...allCards.map(cardRank));
-      if (playerBestRank > bestRank) {
-        bestRank = playerBestRank;
-        winner = player;
-      }
-    }
-  
-    if (winner) {
-      winner.chips += room.pot;
-      console.log(`${winner.name} 获胜，获得 ${room.pot} 筹码`);
-      room.pot = 0;
-    } else {
-      console.warn('无人获胜？可能有bug');
-    }
-  
-    room.phase = 'end';
-  }
-  
-
-function emitRoomUpdate(roomId) {
-  const room = rooms[roomId];
-  if (!room) return;
-  room.players.forEach(player => {
-    io.to(player.id).emit('roomUpdate', getRoomState(room, player.id));
-  });
+    room.phase = 'showdown'; // 用于前端判断是否是结算阶段
 }
 
+function getGameState(room) {
+  return games[room];
+}
+
+function createRoom(room) {
+  if (!games[room]) {
+    games[room] = {
+      players: [],
+      gameStarted: false,
+    };
+  }
+}
+
+function joinRoom(room, playerName) {
+  createRoom(room);
+  const roomGame = games[room];
+  if (!roomGame.players.some(p => p.name === playerName)) {
+    roomGame.players.push({
+      name: playerName,
+      chips: 1000,
+    });
+  }
+}
+function getGameState(roomId, playerName) {
+    const game = games[roomId];
+    if (!game) return {};
+  
+    return {
+      yourName: playerName,
+      yourHand: game.players.find(p => p.name === playerName)?.hand || [],
+      communityCards: game.communityCards,
+      players: game.players.map(p => ({
+        name: p.name,
+        chips: p.chips,
+        bet: p.bet,
+        folded: p.folded,
+        winner: p.winner || false,
+        handDesc: p.handDesc || '',
+        handSolved: p.handSolved || [],
+      })),
+      pot: game.pot,
+      round: game.round,
+      currentPlayer: game.players[game.currentPlayerIndex]?.name,
+      phase: game.round === 'showdown' ? 'end' : 'playing',
+    };
+  }
+  
 module.exports = {
-  createRoomIfNotExists,
-  getRoomState,
+  games,
   startGame,
   handlePlayerAction,
-  nextPhase,
-  settleGame,
-  emitRoomUpdate,
+  getGameState,
+  createRoom,
+  joinRoom,
+  broadcastGameState
 };
